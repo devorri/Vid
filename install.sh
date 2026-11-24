@@ -47,6 +47,16 @@ if ! grep -qxF "i2c-dev" /etc/modules; then
   echo "i2c-dev" | sudo tee -a /etc/modules > /dev/null
 fi
 
+echo "==> Installing cloudflared (public HTTPS link so the Netlify website can play live video/audio)"
+if ! command -v cloudflared > /dev/null 2>&1; then
+  curl -fsSL -o /tmp/cloudflared.deb \
+    https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64.deb \
+    && sudo dpkg -i /tmp/cloudflared.deb \
+    || echo "!! cloudflared install failed -> live video/audio will only work on the local network"
+else
+  echo "    cloudflared already installed"
+fi
+
 echo "==> Creating Python environment (can use the system's GPIO libraries)"
 python3 -m venv --system-site-packages --clear "$PI_DIR/venv"
 "$PI_DIR/venv/bin/pip" install --upgrade pip

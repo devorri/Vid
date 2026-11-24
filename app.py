@@ -14,6 +14,9 @@
  RELAYS  : heating bulb + water solenoid, controlled from Supabase settings
  LOGS    : sensor_logs row every sync_interval_seconds (temps, noise dB, motion from camera)
  HEALTH  : system_settings -> pi_status + cam_status
+ LIVE    : http://<pi-ip>:8080 -> /stream.mjpg (real-time video, ?fps=N to limit)
+           /audio.pcm (real-time mic, 16 kHz s16le mono)
+           cloudflared tunnel -> public https link -> system_settings.pi_live_url -> Netlify site plays it
 
  WIRING (Raspberry Pi 4, physical pin numbers):
    MLX90614   VIN->1 (3.3V)  GND->9   SDA->3 (GPIO2)   SCL->5 (GPIO3)
@@ -34,7 +37,7 @@
  Settings read from system_settings (change them on the website):
    bulb_mode on/off/auto   bulb_start_hour / bulb_end_hour
    solenoid_mode on/off/auto   solenoid_trigger_temp
-     (heat protection: in off/auto, >= trigger -> water 10 min ON / 2 min wait, repeat until cool)
+     (heat protection: in off/auto, >= trigger -> water 1 min ON / 2 min wait, repeat until cool; bulb unaffected)
    sync_interval_seconds   audio_interval_seconds
    cam_live_enabled   cam_live_interval_seconds   cam_flash off/on/night
    audio_threshold 0.30-0.95 (default 0.60)   audio_min_db 30-90 (default 50)
@@ -50,6 +53,9 @@
  Test an audio file with the exact same cough logic (no mic / Supabase needed):
         python app.py --test-audio some_clip.wav
 
+ Test on a laptop with its webcam (no Pi hardware):
+        pip install onnxruntime numpy pillow requests pyserial opencv-python
+        python app.py --webcam --no-audio      -> http://localhost:8080
  Run:   python app.py                (everything)
         python app.py --no-vision    (no camera)
         python app.py --no-audio     (no mic)
@@ -67,6 +73,7 @@ import math
 import os
 import queue
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -113,6 +120,12 @@ MLX_ADDR = 0x5A
 CAM_PORT = os.getenv("CAM_PORT", "auto")       # e.g. /dev/ttyUSB0, or "auto"
 CAM_BAUD = 921600
 CAM_FAILS_BEFORE_RECONNECT = 3
+# Camera source: "esp32" (ESP32-CAM on USB serial, default) or "webcam" (USB / laptop camera, needs opencv-python)
+#   set CAM_SOURCE=webcam in .env, or run:  python app.py --webcam
+WEBCAM_INDEX = int(os.getenv("WEBCAM_INDEX", "0"))          # 0 = first camera (laptop built-in)
+WEBCAM_SIZE = (640, 480)
+WEBCAM_JPEG_QUALITY = 80
+WEBCAM_ROTATE_180 = os.getenv("WEBCAM_ROTATE_180", "1") != "0"   # the website shows the pen cam rotated 180 deg
 MAX_JPEG = 400_000
 
 # Live feed / vision
@@ -135,6 +148,14 @@ VISION_IOU = 0.45
 VISION_MAX_DET = 25
 NIGHT_START, NIGHT_END = 18, 6     # cam_flash = night (Pi local time)
 TRACK_RESET_GAP_S = 30             # forget old tracks after a long pause
+# Real-time local stream (http://<pi-ip>:8080 -> /stream.mjpg)
+STREAM_MAX_FPS = float(os.getenv("STREAM_MAX_FPS", "15"))   # cap; the USB serial link is usually the real limit
+STREAM_IDLE_S = 20                 # no viewer for this long -> back to slow capture (saves CPU / cam heat)
+# Public HTTPS link to this Pi (so the Netlify website can play the live video + audio)
+#   default: free Cloudflare quick tunnel (cloudflared), new random https://xxx.trycloudflare.com each start
+#   PI_PUBLIC_URL=https://pig.yourdomain.com in .env -> use your own fixed tunnel/domain instead
+PI_URL_SETTING = "pi_live_url"     # system_settings key the website reads
+TUNNEL_RETRY_S = 15
 
 # Audio (mic)
 MIC_DEVICE = os.getenv("MIC_DEVICE", "auto")   # e.g. plughw:CARD=sndrpigooglevoi,DEV=0
@@ -713,7 +734,7 @@ class RelayLogic:
           -> open 1 min -> close, wait 2 min -> still >= trigger - 1 C? open again ...
           -> cooled down -> back to normal (closed)
         Works even when settings never loaded (no internet), using 38 C.
-        While cooling, the heating bulb is forced OFF.
+        The heating bulb is NOT touched by cooling (follows bulb_mode / schedule only).
         No valid temperature for 30s -> solenoid closes (fail-safe).
     """
 
@@ -817,8 +838,6 @@ class RelayLogic:
         else:   # auto / schedule
             h = now.hour
             bulb = h >= settings.bulb_start_hour or h < settings.bulb_end_hour
-        if self.phase != "idle":
-            bulb = False                               # never heat while cooling down a heat event
         return bulb, solenoid
 
 
@@ -930,6 +949,106 @@ class SerialCamera:
                 ser.readline()  # END
                 return data
         raise CamError("timeout waiting for image")
+
+
+class WebcamCamera:
+    """
+    USB / laptop webcam with the SAME interface as SerialCamera (open / close / capture / ser / info),
+    so VisionWorker, YOLO, tracking, uploads and the live stream all work unchanged.
+    A background thread keeps reading so capture() always returns the newest frame (no lag from the buffer).
+    """
+
+    def __init__(self, index=None):
+        self.index = WEBCAM_INDEX if index is None else index
+        self.ser = None              # "connected" flag, same name VisionWorker checks for SerialCamera
+        self.port = f"webcam:{self.index}"
+        self.info = ""
+        self._cap = None
+        self._cond = threading.Condition()
+        self._frame = None
+        self._seq = 0
+        self._last_seq = 0
+        self._reader = None
+
+    def open(self):
+        self.close()
+        try:
+            import cv2
+        except ImportError:
+            raise CamError("opencv-python not installed (pip install opencv-python)")
+        self._cv2 = cv2
+        backend = cv2.CAP_DSHOW if sys.platform == "win32" else cv2.CAP_ANY
+        cap = cv2.VideoCapture(self.index, backend)
+        if not cap.isOpened():
+            cap.release()
+            raise CamError(f"webcam {self.index} not found / busy (close Zoom, Teams, the Camera app)")
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, WEBCAM_SIZE[0])
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, WEBCAM_SIZE[1])
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        ok, frame = cap.read()
+        if not ok or frame is None:
+            cap.release()
+            raise CamError(f"webcam {self.index} gives no picture")
+        self._cap = cap
+        self.ser = True
+        h, w = frame.shape[:2]
+        self.info = f"webcam {self.index} {w}x{h}"
+        self._reader = threading.Thread(target=self._read_loop, name="webcam", daemon=True)
+        self._reader.start()
+        log.info("Webcam connected (%s)", self.info)
+
+    def _read_loop(self):
+        cap = self._cap
+        while self.ser and not stop_event.is_set():
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                time.sleep(0.05)
+                continue
+            with self._cond:
+                self._frame = frame
+                self._seq += 1
+                self._cond.notify_all()
+
+    def close(self):
+        self.ser = None
+        if self._reader and self._reader.is_alive():
+            self._reader.join(timeout=2)
+        self._reader = None
+        if self._cap is not None:
+            try:
+                self._cap.release()
+            except Exception:
+                pass
+        self._cap = None
+
+    def capture(self, flash=False):
+        if not self.ser:
+            raise CamError("webcam not open")
+        with self._cond:
+            self._cond.wait_for(lambda: self._seq != self._last_seq or stop_event.is_set(), timeout=5)
+            if self._seq == self._last_seq or self._frame is None:
+                raise CamError("webcam: no new frame for 5s")
+            frame, self._last_seq = self._frame, self._seq
+        cv2 = self._cv2
+        if (frame.shape[1], frame.shape[0]) != WEBCAM_SIZE:
+            frame = cv2.resize(frame, WEBCAM_SIZE, interpolation=cv2.INTER_AREA)
+        if WEBCAM_ROTATE_180:
+            frame = cv2.rotate(frame, cv2.ROTATE_180)
+        ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, WEBCAM_JPEG_QUALITY])
+        if not ok:
+            raise CamError("webcam: JPEG encode failed")
+        return buf.tobytes()
+
+
+def make_camera():
+    src = (CAM_SOURCE_OVERRIDE or read_env("CAM_SOURCE", "esp32")).strip().lower()
+    if src == "webcam":
+        log.info("Camera source: webcam %d", WEBCAM_INDEX)
+        return WebcamCamera()
+    return SerialCamera()
+
+
+CAM_SOURCE_OVERRIDE = None    # set by --webcam
 
 
 # ========================================================
@@ -1083,7 +1202,7 @@ class VisionWorker(threading.Thread):
         self.detector = PigDetector(find_model("best.onnx"))
         self.tracker = PigTracker()
         self.prev_gray = None
-        self.cam = SerialCamera()
+        self.cam = make_camera()
         self.frames = 0
         self.fails = 0
         self.slot = 0
@@ -1092,15 +1211,22 @@ class VisionWorker(threading.Thread):
         self.infer_ms = 0
         self.pigs = self.piglets = self.moving = 0
         self.state = "starting"
+        self.ai_cond = threading.Condition()
+        self.ai_pending = None
+        self.ai_busy = False
 
     def status_text(self):
-        return (f"source=pi-usb cam={self.state} frames={self.frames} fails={self.fails} "
+        return (f"source={self.cam.port or 'pi-usb'} cam={self.state} frames={self.frames} fails={self.fails} "
                 f"infer={self.infer_ms}ms pigs={self.pigs} piglets={self.piglets} moving={self.moving} "
                 f"last={self.last_ok} interval={settings.live_interval}s flash={settings.flash} "
-                f"live={'on' if settings.live_enabled else 'off'} esp=[{self.cam.info}]")
+                f"live={'on' if settings.live_enabled else 'off'} stream={live.stream_fps():.1f}fps "
+                f"viewers={live.viewers} esp=[{self.cam.info}]")
 
     def run(self):
         log.info("Vision model loaded (input %dx%d)", self.detector.size, self.detector.size)
+        # AI + Supabase upload run in their own thread, so the live stream never waits for YOLO / internet
+        threading.Thread(target=self._ai_loop, name="vision-ai", daemon=True).start()
+        ai_due = 0.0
         while not stop_event.is_set():
             if not settings.live_enabled:
                 self.state = "paused"
@@ -1119,9 +1245,18 @@ class VisionWorker(threading.Thread):
                     stop_event.wait(5)
                     continue
 
+            streaming = live.has_viewers(STREAM_IDLE_S)
+            now = time.time()
+            ai_frame = now >= ai_due and not self.ai_busy
+            if not streaming and not ai_frame:
+                # Nobody watching the live stream -> only grab frames for the AI (old behaviour)
+                stop_event.wait(min(0.5, max(0.05, ai_due - now)))
+                continue
+
             t0 = time.time()
             try:
-                jpg = self.cam.capture(settings.flash_now())
+                # Flash only on AI frames (no strobe light on the pigs while streaming)
+                jpg = self.cam.capture(settings.flash_now() if ai_frame else False)
             except CamError as e:
                 self.fails += 1
                 log.warning("Capture failed (%d/%d): %s", self.fails, CAM_FAILS_BEFORE_RECONNECT, e)
@@ -1139,15 +1274,35 @@ class VisionWorker(threading.Thread):
 
             self.fails = 0
             self.state = "ok"
+            live.push_stream(jpg)                      # real-time viewers get EVERY frame
+
+            if ai_frame:
+                ai_due = t0 + settings.live_interval
+                with self.ai_cond:
+                    self.ai_pending = jpg
+                    self.ai_busy = True
+                    self.ai_cond.notify()
+
+            if streaming and STREAM_MAX_FPS > 0:
+                stop_event.wait(max(0.0, 1.0 / STREAM_MAX_FPS - (time.time() - t0)))
+
+        with self.ai_cond:
+            self.ai_cond.notify_all()
+        self.cam.close()
+
+    def _ai_loop(self):
+        while not stop_event.is_set():
+            with self.ai_cond:
+                self.ai_cond.wait_for(lambda: self.ai_pending is not None or stop_event.is_set(), timeout=1.0)
+                jpg, self.ai_pending = self.ai_pending, None
+            if jpg is None:
+                continue
             try:
                 self.process_frame(jpg)
             except Exception as e:   # never let one bad frame kill the thread
                 log.warning("Frame processing error: %s", e)
-
-            # Wait for the next frame
-            stop_event.wait(max(0.0, settings.live_interval - (time.time() - t0)))
-
-        self.cam.close()
+            finally:
+                self.ai_busy = False
 
     def process_frame(self, jpg):
         img = Image.open(io.BytesIO(jpg)).convert("RGB")
@@ -1782,6 +1937,8 @@ class MicWorker(threading.Thread):
             tail = buf[-(len(self.fir) - 1):]
             y = np.convolve(buf, self.fir, mode="valid")[::3]
             y = np.clip(y * AUDIO_GAIN, -1.0, 1.0).astype(np.float32)
+            if live.audio_listeners():
+                live.push_audio((y * 32767.0).astype("<i2").tobytes())   # live listen (100ms blocks)
 
             ring = np.concatenate([ring[len(y):], y])
             new_samples += len(y)
@@ -1885,6 +2042,69 @@ class LiveState:
         self.frame = {}
         self.data = {"started": time.time()}
         self.events = deque(maxlen=20)
+        # real-time stream
+        self.stream_cond = threading.Condition()
+        self.stream_jpg = None
+        self.stream_seq = 0
+        self.stream_times = deque(maxlen=30)
+        self.viewers = 0
+        self.last_viewer_t = 0.0
+        # live audio (raw 16 kHz 16-bit mono PCM for /audio.pcm listeners)
+        self.audio_lock = threading.Lock()
+        self.audio_queues = []
+
+    def audio_listeners(self):
+        return len(self.audio_queues)
+
+    def audio_subscribe(self):
+        q = queue.Queue(maxsize=50)                 # ~5s of audio, older blocks dropped if a phone lags
+        with self.audio_lock:
+            self.audio_queues.append(q)
+        return q
+
+    def audio_unsubscribe(self, q):
+        with self.audio_lock:
+            if q in self.audio_queues:
+                self.audio_queues.remove(q)
+
+    def push_audio(self, pcm16):
+        with self.audio_lock:
+            qs = list(self.audio_queues)
+        for q in qs:
+            try:
+                q.put_nowait(pcm16)
+            except queue.Full:
+                try:
+                    q.get_nowait()                    # drop the oldest -> stay real-time
+                    q.put_nowait(pcm16)
+                except (queue.Empty, queue.Full):
+                    pass
+
+    def push_stream(self, jpg):
+        with self.stream_cond:
+            self.stream_jpg = jpg
+            self.stream_seq += 1
+            self.stream_times.append(time.time())
+            self.stream_cond.notify_all()
+
+    def wait_stream(self, last_seq, timeout=5.0):
+        with self.stream_cond:
+            self.stream_cond.wait_for(lambda: self.stream_seq != last_seq or stop_event.is_set(), timeout=timeout)
+            if self.stream_seq == last_seq:
+                return None, last_seq
+            return self.stream_jpg, self.stream_seq
+
+    def viewer(self, delta):
+        with self.stream_cond:
+            self.viewers = max(0, self.viewers + delta)
+            self.last_viewer_t = time.time()
+
+    def has_viewers(self, grace_s):
+        return self.viewers > 0 or time.time() - self.last_viewer_t < grace_s
+
+    def stream_fps(self):
+        t = [x for x in list(self.stream_times) if time.time() - x < 5]
+        return (len(t) - 1) / (t[-1] - t[0]) if len(t) >= 2 and t[-1] > t[0] else 0.0
 
     def update(self, **kw):
         with self.lock:
@@ -1900,7 +2120,11 @@ class LiveState:
 
     def snapshot(self):
         with self.lock:
-            return {**self.data, "now": time.time(), "frame": self.frame, "events": list(self.events)}
+            snap = {**self.data, "now": time.time(), "frame": self.frame, "events": list(self.events)}
+        snap["stream_fps"] = round(self.stream_fps(), 1)
+        snap["viewers"] = self.viewers
+        snap["listeners"] = self.audio_listeners()
+        return snap
 
     def get_jpg(self):
         with self.lock:
@@ -1950,6 +2174,9 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .events { max-height:180px; overflow:auto; font-size:12px; }
   .events div { padding:3px 0; border-bottom:1px solid var(--line); }
   .dim { color:var(--dim); }
+  .listen { background:var(--line); color:var(--text); border:1px solid var(--line); border-radius:8px;
+            padding:6px 12px; font:inherit; cursor:pointer; }
+  .listen.on { background:rgba(236,72,153,.18); color:var(--pink); border-color:var(--pink); }
 </style>
 </head>
 <body>
@@ -1990,7 +2217,11 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     </section>
 
     <section class="card">
-      <h2>Sound (live, every 1s) <span id="micState" class="pill"></span></h2>
+      <h2>Sound (live) <span id="micState" class="pill"></span></h2>
+      <div class="row" style="margin-bottom:6px">
+        <button id="listenBtn" class="listen">🔊 Listen live</button>
+        <input id="vol" type="range" min="0" max="3" step="0.1" value="1" title="Volume" style="flex:1;margin-left:10px">
+      </div>
       <div class="row"><span class="big" id="db">--</span>
         <div class="bar"><i id="dbBar" style="background:var(--pink)"></i></div></div>
       <div id="classes"></div>
@@ -2018,6 +2249,7 @@ const CLASSES = ["Cough / Sneeze", "Stress / Fight", "Normal sounds", "Feeding",
 const COLORS = ["#ef4444", "#f59e0b", "#22c55e", "#3b82f6", "#8b5cf6"];
 const $ = (id) => document.getElementById(id);
 let lastFrameT = 0, lastFrame = null;
+let streaming = true, piWasDown = false;   // real-time MJPEG; falls back to 1 frame per AI cycle on error
 
 $("classes").innerHTML = CLASSES.map((c, i) =>
   `<div class="cls"><span class="name">${c}</span><div class="bar"><i id="p${i}" style="background:${COLORS[i]}"></i></div><span class="val" id="v${i}">-</span></div>`
@@ -2069,8 +2301,10 @@ async function tick() {
     pill($("conn"), "live", "ok");
   } catch (e) {
     pill($("conn"), "Pi not responding", "bad");
+    piWasDown = true;
     return;
   }
+  if (piWasDown) { piWasDown = false; startStream(); }   // Pi came back -> reconnect the stream
   $("clock").textContent = new Date().toLocaleTimeString();
 
   // --- camera ---
@@ -2079,8 +2313,15 @@ async function tick() {
   pill($("camState"), s.cam_state || "off", camOk ? "ok" : (s.cam_state === "paused" ? "warn" : "bad"));
   if (f.t) {
     const age = Math.round((s.now * 1000 - f.t) / 1000);
-    $("camAge").textContent = age <= 1 ? "now" : age + "s ago";
-    if (f.t !== lastFrameT) {
+    $("camAge").textContent = streaming && s.stream_fps > 0
+      ? `LIVE ${s.stream_fps} fps · AI boxes ${age <= 1 ? "now" : age + "s ago"}`
+      : (age <= 1 ? "now" : age + "s ago");
+    if (streaming && s.stream_fps > 0) $("camMsg").style.display = "none";
+    if (f.t !== lastFrameT && streaming) {
+      lastFrameT = f.t;
+      lastFrame = f;
+      drawBoxes();
+    } else if (f.t !== lastFrameT) {
       lastFrameT = f.t;
       const img = new Image();
       img.onload = () => { $("img").src = img.src; lastFrame = f; $("camMsg").style.display = "none"; drawBoxes(); };
@@ -2138,7 +2379,64 @@ async function tick() {
 }
 
 tick();
-setInterval(tick, 1000);
+// --- Live audio: fetch raw PCM and play it with ~0.3s delay ---
+let audioCtx = null, audioGain = null, audioAbort = null, playHead = 0;
+async function startListen() {
+  const btn = $("listenBtn");
+  audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  audioGain = audioCtx.createGain();
+  audioGain.gain.value = Number($("vol").value);
+  audioGain.connect(audioCtx.destination);
+  audioAbort = new AbortController();
+  btn.textContent = "⏹ Stop"; btn.classList.add("on");
+  let leftover = null;
+  try {
+    const r = await fetch("/audio.pcm?r=" + Date.now(), { signal: audioAbort.signal, cache: "no-store" });
+    const rate = Number(r.headers.get("X-Sample-Rate")) || 16000;
+    const reader = r.body.getReader();
+    playHead = 0;
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      let bytes = value;
+      if (leftover) { const m = new Uint8Array(leftover.length + bytes.length); m.set(leftover); m.set(bytes, leftover.length); bytes = m; leftover = null; }
+      const n = bytes.length >> 1;
+      if (bytes.length & 1) leftover = bytes.slice(bytes.length - 1);
+      if (!n) continue;
+      const i16 = new Int16Array(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + n * 2));
+      const buf = audioCtx.createBuffer(1, n, rate);
+      const ch = buf.getChannelData(0);
+      for (let i = 0; i < n; i++) ch[i] = i16[i] / 32768;
+      const src = audioCtx.createBufferSource();
+      src.buffer = buf; src.connect(audioGain);
+      const now = audioCtx.currentTime;
+      // fell behind (Wi-Fi hiccup) or too far ahead -> jump back to ~0.3s behind live
+      if (playHead < now + 0.05 || playHead > now + 1.0) playHead = now + 0.3;
+      src.start(playHead);
+      playHead += buf.duration;
+    }
+  } catch (e) {
+    if (e.name !== "AbortError") console.warn("live audio stopped:", e);
+  }
+  stopListen();
+}
+function stopListen() {
+  if (audioAbort) { audioAbort.abort(); audioAbort = null; }
+  if (audioCtx) { audioCtx.close(); audioCtx = null; }
+  const btn = $("listenBtn"); btn.textContent = "🔊 Listen live"; btn.classList.remove("on");
+}
+$("listenBtn").addEventListener("click", () => (audioAbort ? stopListen() : startListen()));
+$("vol").addEventListener("input", () => { if (audioGain) audioGain.gain.value = Number($("vol").value); });
+
+function startStream() {
+  streaming = true;
+  $("img").src = "/stream.mjpg?r=" + Date.now();
+}
+$("img").addEventListener("error", () => {
+  if (streaming) { streaming = false; lastFrameT = 0; }   // stream failed -> old snapshot mode
+});
+startStream();
+setInterval(tick, 500);
 </script>
 </body>
 </html>
@@ -2157,6 +2455,63 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _stream(self):
+        """Real-time MJPEG: every camera frame, as soon as it arrives. Works in any <img> tag."""
+        self.send_response(200)
+        self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        try:
+            q = dict(kv.split("=", 1) for kv in self.path.split("?", 1)[1].split("&") if "=" in kv) \
+                if "?" in self.path else {}
+            max_fps = float(q.get("fps", 0))
+        except ValueError:
+            max_fps = 0.0
+        min_gap = 1.0 / max_fps if max_fps > 0 else 0.0
+        live.viewer(+1)
+        try:
+            seq = 0
+            last_sent = 0.0
+            while not stop_event.is_set():
+                jpg, seq = live.wait_stream(seq, timeout=5.0)
+                if jpg is None:
+                    continue
+                if min_gap and time.time() - last_sent < min_gap:
+                    continue
+                last_sent = time.time()
+                self.wfile.write(b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "
+                                 + str(len(jpg)).encode() + b"\r\n\r\n")
+                self.wfile.write(jpg)
+                self.wfile.write(b"\r\n")
+                self.wfile.flush()
+        finally:
+            live.viewer(-1)
+
+    def _audio(self):
+        """Real-time mic: raw 16 kHz, 16-bit, mono PCM (little-endian). Played by the page with Web Audio."""
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("X-Sample-Rate", str(SAMPLE_RATE))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        q = live.audio_subscribe()
+        log.info("[AUDIO] live listener connected (%d)", live.audio_listeners())
+        try:
+            while not stop_event.is_set():
+                try:
+                    pcm = q.get(timeout=5)
+                except queue.Empty:
+                    continue
+                self.wfile.write(pcm)
+                self.wfile.flush()
+        finally:
+            live.audio_unsubscribe(q)
+            log.info("[AUDIO] live listener left (%d)", live.audio_listeners())
+
     def do_GET(self):
         path = self.path.split("?", 1)[0]
         try:
@@ -2164,6 +2519,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self._send(200, DASHBOARD_HTML.encode(), "text/html; charset=utf-8")
             elif path == "/state.json":
                 self._send(200, json.dumps(live.snapshot()).encode(), "application/json")
+            elif path == "/stream.mjpg":
+                self._stream()
+            elif path == "/audio.pcm":
+                self._audio()
             elif path == "/frame.jpg":
                 jpg = live.get_jpg()
                 if jpg:
@@ -2174,6 +2533,100 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self._send(404, b"not found", "text/plain")
         except (BrokenPipeError, ConnectionResetError):
             pass
+
+
+def find_cloudflared():
+    """cloudflared on PATH, or in the usual install folders (winget / MSI on Windows, apt/dpkg on the Pi)."""
+    exe = shutil.which("cloudflared")
+    if exe:
+        return exe
+    candidates = ["/usr/local/bin/cloudflared", "/usr/bin/cloudflared"]
+    if sys.platform == "win32":
+        for base in (os.getenv("ProgramFiles(x86)"), os.getenv("ProgramFiles"), os.getenv("LOCALAPPDATA")):
+            if base:
+                candidates += [os.path.join(base, "cloudflared", "cloudflared.exe")]
+        local = os.getenv("LOCALAPPDATA")
+        if local:   # winget portable installs
+            candidates += glob.glob(os.path.join(local, "Microsoft", "WinGet", "Packages", "Cloudflare.cloudflared*", "*.exe"))
+            candidates += [os.path.join(local, "Microsoft", "WinGet", "Links", "cloudflared.exe")]
+    for c in candidates:
+        if c and os.path.isfile(c):
+            return c
+    return None
+
+
+class TunnelWorker(threading.Thread):
+    """
+    Gives the local dashboard (live video /stream.mjpg + live audio /audio.pcm) a public HTTPS link,
+    and saves it to system_settings.pi_live_url so the Netlify website can use it.
+    HTTPS is required: an https:// website is not allowed to load http://<pi-ip> (mixed content).
+    """
+
+    URL_RE = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com")
+
+    def __init__(self, sb_url, sb_key):
+        super().__init__(name="tunnel", daemon=True)
+        self.sb = Supabase(sb_url, sb_key)
+        self.url = None
+        self.state = "starting"
+        self.proc = None
+
+    def status_text(self):
+        return f"tunnel={self.state} url={self.url or '-'}"
+
+    def _publish(self, url):
+        for _ in range(5):
+            try:
+                self.sb.set_setting(PI_URL_SETTING, url)
+                log.info("[TUNNEL] Website live link saved: %s", url or "(cleared)")
+                return
+            except requests.RequestException as e:
+                log.warning("[TUNNEL] could not save link (%s), retrying", e)
+                if stop_event.wait(5):
+                    return
+
+    def run(self):
+        fixed = read_env("PI_PUBLIC_URL").rstrip("/")
+        if fixed:
+            self.url, self.state = fixed, "fixed"
+            self._publish(fixed)
+            return
+        exe = find_cloudflared()
+        if not exe:
+            self.state = "no-cloudflared"
+            log.warning("[TUNNEL] cloudflared not installed -> live video/audio only on the local network. "
+                        "Run install.sh again to install it.")
+            return
+        while not stop_event.is_set():
+            self.state = "connecting"
+            cmd = [exe, "tunnel", "--no-autoupdate", "--url", f"http://localhost:{DASH_PORT}"]
+            try:
+                self.proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                                             text=True, bufsize=1)
+                for line in self.proc.stderr:
+                    if stop_event.is_set():
+                        break
+                    m = self.URL_RE.search(line)
+                    if m and m.group(0) != self.url:
+                        self.url, self.state = m.group(0), "ok"
+                        live.update(public_url=self.url)
+                        live.event("info", f"Public live link: {self.url}")
+                        self._publish(self.url)
+            except Exception as e:
+                log.warning("[TUNNEL] error: %s", e)
+            finally:
+                if self.proc and self.proc.poll() is None:
+                    self.proc.terminate()
+            if stop_event.is_set():
+                break
+            self.state, self.url = "down", None
+            self._publish("")                 # website falls back to the 2-3s snapshots
+            log.warning("[TUNNEL] cloudflared stopped, restarting in %ds", TUNNEL_RETRY_S)
+            stop_event.wait(TUNNEL_RETRY_S)
+
+    def stop(self):
+        if self.proc and self.proc.poll() is None:
+            self.proc.terminate()
 
 
 def start_dashboard():
@@ -2196,6 +2649,14 @@ def cpu_temp():
         with open("/sys/class/thermal/thermal_zone0/temp") as f:
             return f"{int(f.read()) / 1000:.1f}C"
     except OSError:
+        return "?"
+
+
+def load_avg():
+    """1-minute load average (Linux / Pi). Windows has none -> '?'."""
+    try:
+        return f"{os.getloadavg()[0]:.2f}"
+    except (AttributeError, OSError):
         return "?"
 
 
@@ -2228,7 +2689,15 @@ def main():
     parser.add_argument("--no-audio", action="store_true", help="don't run the microphone part")
     parser.add_argument("--no-dashboard", action="store_true", help="don't serve the local dashboard")
     parser.add_argument("--test-audio", metavar="FILE", help="run the cough check on an audio file and exit")
+    parser.add_argument("--webcam", nargs="?", const=-1, type=int, metavar="INDEX",
+                        help="use a USB / laptop webcam instead of the ESP32-CAM (optional camera number, default 0)")
     args = parser.parse_args()
+
+    if args.webcam is not None:
+        global CAM_SOURCE_OVERRIDE, WEBCAM_INDEX
+        CAM_SOURCE_OVERRIDE = "webcam"
+        if args.webcam >= 0:
+            WEBCAM_INDEX = args.webcam
 
     if args.test_audio:
         return test_audio_file(args.test_audio)
@@ -2263,6 +2732,10 @@ def main():
         log.warning("Settings fetch failed (relays stay OFF until it works): %s", e)
 
     dashboard = None if args.no_dashboard else start_dashboard()
+    tunnel = None
+    if dashboard:
+        tunnel = TunnelWorker(sb_url, sb_key)
+        tunnel.start()
     publisher = RelayStatePublisher(Supabase(sb_url, sb_key))
     publisher.start()
     sms_worker = SmsWorker(sb_url, sb_key)
@@ -2356,13 +2829,15 @@ def main():
         if now - last_status >= STATUS_EVERY_S:
             last_status = now
             pi_status = (f"uptime={int((now - boot) / 60)}min cpu={cpu_temp()} "
-                         f"load={os.getloadavg()[0]:.2f} memfree={mem_free_mb()}MB throttled={throttled()} "
+                         f"load={load_avg()} memfree={mem_free_mb()}MB throttled={throttled()} "
                          f"ambient={ambient} floor={floor} "
                          f"bulb={'ON' if relays.bulb_on else 'OFF'} solenoid={'ON' if relays.solenoid_on else 'OFF'} "
                          f"settings={'ok' if settings.loaded else 'NOT_LOADED'}")
             if audio:
                 pi_status += " " + audio.status_text()
             pi_status += " " + sms_worker.status_text()
+            if tunnel:
+                pi_status += " " + tunnel.status_text()
             for key, value in (("pi_status", pi_status),
                                ("cam_status", vision.status_text() if vision else None)):
                 if value is None:
@@ -2384,6 +2859,8 @@ def main():
 
     log.info("Stopping... (relays OFF)")
     relays.all_off()
+    if tunnel:
+        tunnel.stop()
     if dashboard:
         dashboard.shutdown()
     for worker in (vision, audio):
